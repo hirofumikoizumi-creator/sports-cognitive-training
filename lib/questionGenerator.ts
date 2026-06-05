@@ -1,4 +1,29 @@
-import type { CognitiveTask, CognitiveType, MotionType, TrainingQuestion } from './types';
+type CognitiveType = 'color' | 'number' | 'reverse' | 'condition';
+type MotionType =
+  | 'step_right'
+  | 'step_left'
+  | 'step_forward'
+  | 'step_back'
+  | 'jump'
+  | 'squat'
+  | 'turn_right'
+  | 'turn_left'
+  | 'raise_right'
+  | 'raise_left'
+  | 'balance';
+
+type CognitiveTask = {
+  type: CognitiveType;
+  display: string;
+  speech: string;
+  correctMotion: MotionType;
+};
+
+export type LegacyTrainingQuestion = {
+  cognitive: CognitiveTask;
+  motionLabel: string;
+  speechText: string;
+};
 
 // ===== 認知課題定義 =====
 
@@ -118,7 +143,7 @@ function generateReverseTask(): CognitiveTask {
 
 // ===== メイン生成関数 =====
 
-export function generateQuestion(): TrainingQuestion {
+export function generateQuestion(): LegacyTrainingQuestion {
   const cognitiveTypes: CognitiveType[] = ['color', 'number', 'reverse', 'condition'];
   const type = randomItem(cognitiveTypes);
 
