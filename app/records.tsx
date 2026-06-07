@@ -5,6 +5,7 @@ import { useColors } from '@/hooks/use-colors';
 import { calcStats } from '@/lib/storage';
 import type { TrainingResult } from '@/lib/types';
 import { DIFFICULTY_CONFIG } from '@/lib/types';
+import { AdBanner } from '@/components/AdBanner';
 
 const RANK_COLORS: Record<string, string> = {
   S: '#FFD700',
@@ -118,10 +119,7 @@ export default function RecordsScreen() {
           />
         )}
 
-        {/* バナー広告プレースホルダー */}
-        <View style={[styles.adBanner, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <Text style={[styles.adText, { color: colors.muted }]}>広告</Text>
-        </View>
+        <AdBanner style={styles.adBanner} />
       </View>
     </ScreenContainer>
   );
@@ -221,14 +219,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   adBanner: {
-    height: 50,
-    borderRadius: 8,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
     marginTop: 8,
-  },
-  adText: {
-    fontSize: 12,
   },
 });

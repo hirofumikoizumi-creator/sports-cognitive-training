@@ -2,12 +2,12 @@
 import "./scripts/load-env.js";
 import type { ExpoConfig } from "expo/config";
 
-const bundleId = "com.hirofumikoizumi.sportscognitivetraining";
-const scheme = "sportscognitivetraining";
+const bundleId = "com.hkfootballacademy";
+const scheme = "sportsreactiontraining";
 
 const env = {
-  appName: "スポ認トレ",
-  appSlug: "sports-cognitive-training",
+  appName: "スポーツ認知反応トレーニング",
+  appSlug: "sports-reaction-training",
   logoUrl: "https://d2xsxph8kpxj0f.cloudfront.net/310519663715585673/UDv6nkGGFo6yKXkhShyMXi/icon-K7FTpq44oVVd4MK7cqNiNc.png",
   scheme,
   iosBundleId: bundleId,
@@ -85,7 +85,7 @@ const config: ExpoConfig = {
       "react-native-google-mobile-ads",
       {
         androidAppId: "ca-app-pub-3940256099942544~3347511713",
-        iosAppId: "ca-app-pub-3940256099942544~1458002511",
+        iosAppId: "ca-app-pub-5840457424714744~4774072260",
       },
     ],
     [

@@ -1,23 +1,20 @@
 /**
  * AdBanner コンポーネント
  *
- * 開発中はGoogle公式テスト広告IDを使用。
- * 本番リリース時は環境変数 ADMOB_BANNER_ID_IOS / ADMOB_BANNER_ID_ANDROID に
- * 実際の広告ユニットIDを設定してください。
- *
- * テスト広告ID:
- *   iOS:     ca-app-pub-3940256099942544/2934735716
- *   Android: ca-app-pub-3940256099942544/6300978111
+ * iOS は AdMob の本番広告ユニット ID を使用します。
+ * Android は未設定のため、Google 公式テスト広告 ID を使用します。
  */
 
 import { View, Text, StyleSheet, Platform } from 'react-native';
 import { useColors } from '@/hooks/use-colors';
 
-// 本番時は環境変数から取得
-const TEST_BANNER_ID_IOS = 'ca-app-pub-3940256099942544/2934735716';
+const BANNER_ID_IOS = 'ca-app-pub-5840457424714744/6697831949';
+const INTERSTITIAL_ID_IOS = 'ca-app-pub-5840457424714744/2147908924';
 const TEST_BANNER_ID_ANDROID = 'ca-app-pub-3940256099942544/6300978111';
+const TEST_INTERSTITIAL_ID_ANDROID = 'ca-app-pub-3940256099942544/1033173712';
 
-const BANNER_ID = Platform.OS === 'ios' ? TEST_BANNER_ID_IOS : TEST_BANNER_ID_ANDROID;
+const BANNER_ID = Platform.OS === 'ios' ? BANNER_ID_IOS : TEST_BANNER_ID_ANDROID;
+const INTERSTITIAL_ID = Platform.OS === 'ios' ? INTERSTITIAL_ID_IOS : TEST_INTERSTITIAL_ID_ANDROID;
 
 interface AdBannerProps {
   style?: object;
@@ -39,11 +36,11 @@ export function AdBanner({ style }: AdBannerProps) {
   // ネイティブ: 動的インポートで BannerAd を使用
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { BannerAd, BannerAdSize, TestIds } = require('react-native-google-mobile-ads');
+    const { BannerAd, BannerAdSize } = require('react-native-google-mobile-ads');
     return (
       <View style={[styles.container, style]}>
         <BannerAd
-          unitId={TestIds.BANNER}
+          unitId={BANNER_ID}
           size={BannerAdSize.BANNER}
           requestOptions={{ requestNonPersonalizedAdsOnly: true }}
           onAdFailedToLoad={() => {}}
@@ -76,4 +73,4 @@ const styles = StyleSheet.create({
   },
 });
 
-export { BANNER_ID };
+export { BANNER_ID, INTERSTITIAL_ID };

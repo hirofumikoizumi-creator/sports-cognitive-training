@@ -5,6 +5,7 @@ import { ScreenContainer } from '@/components/screen-container';
 import { useAppContext } from '@/lib/AppContext';
 import { useColors } from '@/hooks/use-colors';
 import { calcStats } from '@/lib/storage';
+import { AdBanner } from '@/components/AdBanner';
 
 export default function HomeScreen() {
   const router = useRouter();
@@ -90,10 +91,7 @@ export default function HomeScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* バナー広告プレースホルダー */}
-        <View style={[styles.adBanner, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <Text style={[styles.adText, { color: colors.muted }]}>広告</Text>
-        </View>
+        <AdBanner style={styles.adBanner} />
       </View>
     </ScreenContainer>
   );
@@ -167,13 +165,5 @@ const styles = StyleSheet.create({
   },
   adBanner: {
     width: '100%',
-    height: 50,
-    borderRadius: 8,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  adText: {
-    fontSize: 12,
   },
 });

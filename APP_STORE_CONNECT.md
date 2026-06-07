@@ -5,10 +5,12 @@
 ## 1. Apple 側で先に作るもの
 
 - Apple Developer Program の有効なメンバーシップ
-- App Store Connect の新規アプリ
-  - App name: `スポ認トレ`
-  - Bundle ID: `com.hirofumikoizumi.sportscognitivetraining`
-  - SKU: `sports-cognitive-training`
+- App Store Connect のアプリ
+  - App name: `スポーツ認知反応トレーニング`
+  - Bundle ID: `com.hkfootballacademy`
+  - Bundle ID name: `sportsreactiontraining`
+  - SKU: `sports-reaction-training`
+  - Apple ID: `6777510970`
   - Platform: iOS
 - App Privacy の回答
 - 13 歳未満向けではない場合は、年齢制限を通常どおり設定
@@ -52,6 +54,9 @@ App Store Connect で処理完了後、TestFlight タブから内部テスター
 
 ## 注意
 
-- AdMob は現在 Google のテスト App ID / 広告ユニット ID です。本番公開前に実 ID へ差し替えてください。
+- AdMob iOS App ID: `ca-app-pub-5840457424714744~4774072260`
+- AdMob banner unit: `ca-app-pub-5840457424714744/6697831949`
+- AdMob interstitial unit: `ca-app-pub-5840457424714744/2147908924`
+- Android の AdMob ID は未設定のため、現在は Google 公式テスト ID です。
 - カメラを使用するため、App Privacy と権限説明文は実際の用途と一致させてください。
 - App Store 審査提出前には、実機でトレーニング開始から結果保存まで確認してください。

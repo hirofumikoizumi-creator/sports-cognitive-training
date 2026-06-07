@@ -4,6 +4,7 @@ import { useAppContext } from '@/lib/AppContext';
 import { useColors } from '@/hooks/use-colors';
 import { useThemeContext } from '@/lib/theme-provider';
 import { clearResults } from '@/lib/storage';
+import { AdBanner } from '@/components/AdBanner';
 
 export default function SettingsScreen() {
   const { state, updateSettings } = useAppContext();
@@ -104,13 +105,10 @@ export default function SettingsScreen() {
         </View>
         <View style={[styles.row, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Text style={[styles.rowLabel, { color: colors.foreground, fontSize }]}>アプリ名</Text>
-          <Text style={[styles.rowValue, { color: colors.muted, fontSize }]}>スポ認トレ</Text>
+          <Text style={[styles.rowValue, { color: colors.muted, fontSize }]}>スポーツ認知反応トレーニング</Text>
         </View>
 
-        {/* バナー広告プレースホルダー */}
-        <View style={[styles.adBanner, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <Text style={[styles.adText, { color: colors.muted }]}>広告</Text>
-        </View>
+        <AdBanner style={styles.adBanner} />
       </View>
     </ScreenContainer>
   );
@@ -166,14 +164,6 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
   adBanner: {
-    height: 50,
-    borderRadius: 8,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
     marginTop: 'auto',
-  },
-  adText: {
-    fontSize: 12,
   },
 });
