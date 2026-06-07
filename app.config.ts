@@ -73,6 +73,11 @@ const config: ExpoConfig = {
     output: "static",
     favicon: "./assets/images/favicon.png",
   },
+  extra: {
+    eas: {
+      projectId: "98c0dacf-16e0-4a13-806d-1c0f331615e4",
+    },
+  },
   plugins: [
     [
       "expo-screen-orientation",
