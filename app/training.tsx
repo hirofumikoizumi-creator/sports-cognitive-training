@@ -27,6 +27,13 @@ const RETURN_FRAMES_REQUIRED = 2;
 
 type ExpectedMotion = 'step_forward' | 'step_back' | 'step_left' | 'step_right';
 type MotionPhase = 'settling' | 'waitingAway' | 'waitingReturn';
+type CalibrationKey = 'center' | Direction;
+
+interface LumaFrame {
+  width: number;
+  height: number;
+  luma: Uint8Array;
+}
 
 interface FrameAnalysis {
   changeRatio: number;
@@ -38,6 +45,12 @@ interface FrameAnalysis {
   centerRatio: number;
   forwardRatio: number;
   backRatio: number;
+}
+
+interface CalibrationStatus {
+  key: CalibrationKey;
+  title: string;
+  detail: string;
 }
 
 const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
@@ -64,7 +77,7 @@ function decodeBase64(input: string): Uint8Array {
   return new Uint8Array(bytes);
 }
 
-function toLumaFrame(base64: string): { width: number; height: number; luma: Uint8Array } | null {
+function toLumaFrame(base64: string): LumaFrame | null {
   try {
     const decoded = jpeg.decode(decodeBase64(base64), { useTArray: true });
     const luma = new Uint8Array(decoded.width * decoded.height);
@@ -80,8 +93,8 @@ function toLumaFrame(base64: string): { width: number; height: number; luma: Uin
 }
 
 function analyzeAgainstBaseline(
-  baseline: { width: number; height: number; luma: Uint8Array },
-  current: { width: number; height: number; luma: Uint8Array },
+  baseline: LumaFrame,
+  current: LumaFrame,
 ): FrameAnalysis | null {
   if (baseline.width !== current.width || baseline.height !== current.height) return null;
 
@@ -176,6 +189,71 @@ function isAwayMotion(expected: ExpectedMotion, analysis: FrameAnalysis): boolea
   }
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function directionFromMotion(motion: ExpectedMotion): Direction {
+  const motionToDirection: Record<ExpectedMotion, Direction> = {
+    step_forward: 'forward',
+    step_back: 'back',
+    step_left: 'left',
+    step_right: 'right',
+  };
+  return motionToDirection[motion];
+}
+
+function directionScore(direction: Direction, analysis: FrameAnalysis): number {
+  switch (direction) {
+    case 'right':
+      return analysis.rightRatio * 2.8 + Math.max(0, analysis.centerX - 0.52) * 0.9 + analysis.changeRatio;
+    case 'left':
+      return analysis.leftRatio * 2.8 + Math.max(0, 0.48 - analysis.centerX) * 0.9 + analysis.changeRatio;
+    case 'forward':
+      return analysis.forwardRatio * 2.4 + Math.max(0, analysis.centerY - 0.50) * 0.7 + analysis.changeRatio * 1.4;
+    case 'back':
+      return analysis.backRatio * 2.4 + Math.max(0, 0.50 - analysis.centerY) * 0.7 + analysis.changeRatio * 1.2;
+    default:
+      return 0;
+  }
+}
+
+function calibratedDirectionScore(
+  direction: Direction,
+  analysis: FrameAnalysis,
+  templates: Partial<Record<Direction, FrameAnalysis>>,
+): number {
+  const rawScore = directionScore(direction, analysis);
+  const template = templates[direction];
+  if (!template) return rawScore;
+
+  const sameShape =
+    Math.max(0, 0.04 - Math.abs(directionScore(direction, template) - rawScore)) * 8 +
+    Math.max(0, 0.20 - Math.abs(template.centerX - analysis.centerX)) * 0.5 +
+    Math.max(0, 0.20 - Math.abs(template.centerY - analysis.centerY)) * 0.5;
+
+  return rawScore + sameShape;
+}
+
+function detectCalibratedMotion(
+  expected: ExpectedMotion,
+  analysis: FrameAnalysis,
+  templates: Partial<Record<Direction, FrameAnalysis>>,
+): boolean {
+  if (analysis.changeRatio < AWAY_CHANGE_RATIO) return false;
+
+  const expectedDirection = directionFromMotion(expected);
+  const expectedScore = calibratedDirectionScore(expectedDirection, analysis, templates);
+  const otherScores = (['forward', 'back', 'left', 'right'] as Direction[])
+    .filter(direction => direction !== expectedDirection)
+    .map(direction => calibratedDirectionScore(direction, analysis, templates));
+  const bestOther = Math.max(0, ...otherScores);
+  const templateScore = directionScore(expectedDirection, templates[expectedDirection] ?? analysis);
+  const adaptiveThreshold = Math.max(TARGET_ZONE_RATIO * 1.8, Math.min(0.09, templateScore * 0.34));
+
+  return expectedScore >= adaptiveThreshold && expectedScore >= bestOther * 0.82;
+}
+
 export default function TrainingScreen() {
   useKeepAwake();
   useScreenOrientation('LANDSCAPE');
@@ -217,9 +295,16 @@ export default function TrainingScreen() {
   const [timerProgress, setTimerProgress] = useState(1);
   const [isFinished, setIsFinished] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+  const [calibrationDone, setCalibrationDone] = useState(Platform.OS === 'web');
+  const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatus>({
+    key: 'center',
+    title: '中央',
+    detail: '中央に立ってください',
+  });
   const [trainingStarted, setTrainingStarted] = useState(false);
   const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
   const [motionHint, setMotionHint] = useState('中央で待機');
+  const [debugMotionText, setDebugMotionText] = useState('');
 
   const cameraRef = useRef<CameraView | null>(null);
   const questionStartTime = useRef(Date.now());
@@ -227,12 +312,15 @@ export default function TrainingScreen() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const captureRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const baselineFrame = useRef<{ width: number; height: number; luma: Uint8Array } | null>(null);
+  const baselineFrame = useRef<LumaFrame | null>(null);
   const baselineReadyAt = useRef(0);
+  const directionTemplates = useRef<Partial<Record<Direction, FrameAnalysis>>>({});
   const motionPhase = useRef<MotionPhase>('settling');
   const returnFrames = useRef(0);
   const judgedRef = useRef(false);
   const captureBusy = useRef(false);
+  const calibrationRunning = useRef(false);
+  const unmountedRef = useRef(false);
   const feedbackAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -241,7 +329,16 @@ export default function TrainingScreen() {
     }
   }, [permission?.granted, requestPermission]);
 
-  const canStartCountdown = Platform.OS === 'web' || (permission?.granted && cameraReady);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      Speech.stop();
+    };
+  }, []);
+
+  const canStartCalibration = Platform.OS !== 'web' && permission?.granted && cameraReady;
+  const canStartCountdown = Platform.OS === 'web' || calibrationDone;
 
   // ===== 問題表示テキストを生成 =====
   const getQuestionDisplay = (q: TrainingQuestion): string => {
@@ -322,14 +419,28 @@ export default function TrainingScreen() {
     return colorCues[q.color];
   };
 
+  const captureLumaSnapshot = useCallback(async (): Promise<LumaFrame | null> => {
+    if (Platform.OS === 'web' || !cameraRef.current) return null;
+
+    const photo = await cameraRef.current.takePictureAsync({
+      base64: true,
+      quality: 0.2,
+      skipProcessing: true,
+      shutterSound: false,
+    });
+
+    if (!photo.base64) return null;
+    return toLumaFrame(photo.base64);
+  }, []);
+
   // ===== 問題開始 =====
   const startQuestion = useCallback((q: TrainingQuestion) => {
     setCurrentQuestion(q);
     setJudgeResult(null);
     setMotionHint('中央で待機');
+    setDebugMotionText('');
     judgedRef.current = false;
-    baselineFrame.current = null;
-    baselineReadyAt.current = Date.now() + BASELINE_DELAY_MS;
+    baselineReadyAt.current = Date.now() + 250;
     motionPhase.current = 'settling';
     returnFrames.current = 0;
     questionStartTime.current = Date.now();
@@ -374,15 +485,7 @@ export default function TrainingScreen() {
 
     captureBusy.current = true;
     try {
-      const photo = await cameraRef.current.takePictureAsync({
-        base64: true,
-        quality: 0.16,
-        skipProcessing: true,
-        shutterSound: false,
-      });
-      if (!photo.base64) return;
-
-      const frame = toLumaFrame(photo.base64);
+      const frame = await captureLumaSnapshot();
       if (!frame) return;
 
       if (!baselineFrame.current || Date.now() < baselineReadyAt.current) {
@@ -396,6 +499,10 @@ export default function TrainingScreen() {
 
       const expectedMotion = getExpectedMotion(currentQuestion);
       const expectedDirection = getExpectedDirection(currentQuestion);
+      const directionScores = (['right', 'left', 'forward', 'back'] as Direction[])
+        .map(direction => `${getDirectionMoveLabel(direction).replace('へ移動', '')}:${Math.round(calibratedDirectionScore(direction, analysis, directionTemplates.current) * 100)}`)
+        .join(' / ');
+      setDebugMotionText(`変化:${Math.round(analysis.changeRatio * 1000)} / ${directionScores}`);
 
       if (motionPhase.current === 'settling') {
         motionPhase.current = 'waitingAway';
@@ -403,7 +510,7 @@ export default function TrainingScreen() {
       }
 
       if (motionPhase.current === 'waitingAway') {
-        if (isAwayMotion(expectedMotion, analysis)) {
+        if (detectCalibratedMotion(expectedMotion, analysis, directionTemplates.current) || isAwayMotion(expectedMotion, analysis)) {
           motionPhase.current = 'waitingReturn';
           returnFrames.current = 0;
           setMotionHint('中央に戻る');
@@ -426,7 +533,7 @@ export default function TrainingScreen() {
     } finally {
       captureBusy.current = false;
     }
-  }, [cameraReady, currentQuestion, isFinished, trainingStarted]);
+  }, [cameraReady, captureLumaSnapshot, currentQuestion, isFinished, trainingStarted]);
 
   // ===== カメラフレーム判定ループ =====
   useEffect(() => {
@@ -516,6 +623,73 @@ export default function TrainingScreen() {
     });
   }, [lv, diff, addResult, router]);
 
+  // ===== セッション専用キャリブレーション =====
+  useEffect(() => {
+    if (!canStartCalibration || calibrationDone || calibrationRunning.current) return;
+
+    const directionSteps: Array<{ key: Direction; title: string; cue: string }> = [
+      { key: 'right', title: '右', cue: 'みぎ！' },
+      { key: 'left', title: '左', cue: 'ひだり！' },
+      { key: 'forward', title: '前', cue: 'まえ！' },
+      { key: 'back', title: '後', cue: 'うしろ！' },
+    ];
+
+    calibrationRunning.current = true;
+
+    const speak = (text: string) => {
+      if (state.settings.voiceEnabled && Platform.OS !== 'web') {
+        Speech.stop();
+        Speech.speak(text, { language: 'ja-JP', rate: 1.08, pitch: 1.05 });
+      }
+    };
+
+    const runCalibration = async () => {
+      try {
+        setCalibrationStatus({ key: 'center', title: '中央', detail: '中央の枠に立ってください' });
+        speak('ちゅうおう');
+        await wait(1200);
+        if (unmountedRef.current) return;
+
+        const centerFrame = await captureLumaSnapshot();
+        if (centerFrame) {
+          baselineFrame.current = centerFrame;
+        }
+
+        for (const step of directionSteps) {
+          if (unmountedRef.current) return;
+          setCalibrationStatus({ key: step.key, title: step.title, detail: `${step.title}の領域へ移動してください` });
+          speak(step.cue);
+          await wait(1300);
+          if (unmountedRef.current) return;
+
+          const directionFrame = await captureLumaSnapshot();
+          if (directionFrame && baselineFrame.current) {
+            const analysis = analyzeAgainstBaseline(baselineFrame.current, directionFrame);
+            if (analysis && analysis.changeRatio > 0) {
+              directionTemplates.current[step.key] = analysis;
+            }
+          }
+
+          setCalibrationStatus({ key: 'center', title: '中央', detail: '中央へ戻ってください' });
+          speak('ちゅうおう');
+          await wait(1000);
+          if (unmountedRef.current) return;
+
+          const returnedCenterFrame = await captureLumaSnapshot();
+          if (returnedCenterFrame) {
+            baselineFrame.current = returnedCenterFrame;
+          }
+        }
+
+        setCalibrationDone(true);
+      } finally {
+        calibrationRunning.current = false;
+      }
+    };
+
+    runCalibration();
+  }, [calibrationDone, canStartCalibration, captureLumaSnapshot, state.settings.voiceEnabled]);
+
   // 初回問題開始
   useEffect(() => {
     if (!canStartCountdown || trainingStarted || countdownRef.current) return;
@@ -541,7 +715,6 @@ export default function TrainingScreen() {
         clearInterval(countdownRef.current);
         countdownRef.current = null;
       }
-      Speech.stop();
     };
   }, [canStartCountdown, questions, startQuestion, trainingStarted]);
 
@@ -646,7 +819,16 @@ export default function TrainingScreen() {
 
       {/* 問題表示 */}
       <View style={styles.questionArea}>
-        {!trainingStarted ? (
+        {!calibrationDone ? (
+          <View style={styles.calibrationBox}>
+            <Text style={[styles.calibrationTitle, { fontSize: isTablet ? 72 : 56 }]}>
+              {calibrationStatus.title}
+            </Text>
+            <Text style={[styles.calibrationText, { fontSize: isTablet ? 22 : 18 }]}>
+              {calibrationStatus.detail}
+            </Text>
+          </View>
+        ) : !trainingStarted ? (
           <View style={styles.countdownBox}>
             <Text style={[styles.countdownNumber, { fontSize: isTablet ? 96 : 76 }]}>
               {countdown}
@@ -667,6 +849,11 @@ export default function TrainingScreen() {
               <Text style={[styles.motionHintText, { fontSize: isTablet ? 20 : 16 }]}>
                 {motionHint}
               </Text>
+              {!!debugMotionText && (
+                <Text style={styles.debugMotionText}>
+                  {debugMotionText}
+                </Text>
+              )}
             </View>
           </>
         )}
@@ -862,6 +1049,32 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 8,
   },
+  calibrationBox: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    minWidth: 240,
+    paddingHorizontal: 32,
+    paddingVertical: 20,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,0,0,0.58)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.34)',
+  },
+  calibrationTitle: {
+    color: '#FFFFFF',
+    fontWeight: '900',
+    lineHeight: 86,
+    textAlign: 'center',
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+  },
+  calibrationText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+    textAlign: 'center',
+  },
   countdownBox: {
     alignItems: 'center',
     justifyContent: 'center',
@@ -896,6 +1109,13 @@ const styles = StyleSheet.create({
   motionHintText: {
     color: '#FFFFFF',
     fontWeight: '800',
+  },
+  debugMotionText: {
+    marginTop: 4,
+    color: 'rgba(255,255,255,0.68)',
+    fontSize: 10,
+    fontWeight: '700',
+    textAlign: 'center',
   },
   feedbackOverlay: {
     ...StyleSheet.absoluteFillObject,

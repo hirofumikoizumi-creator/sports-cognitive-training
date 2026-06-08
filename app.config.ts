@@ -26,7 +26,7 @@ const config: ExpoConfig = {
   ios: {
     supportsTablet: true,
     bundleIdentifier: env.iosBundleId,
-    buildNumber: "3",
+    buildNumber: "4",
     infoPlist: {
       ITSAppUsesNonExemptEncryption: false,
       NSCameraUsageDescription: "カメラを使用して全身の動きを認識し、トレーニング中の動作判定を行います。",
