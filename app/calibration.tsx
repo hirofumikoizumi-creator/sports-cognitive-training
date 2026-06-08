@@ -74,7 +74,7 @@ export default function CalibrationScreen() {
     <View style={styles.container}>
       {/* カメラプレビュー */}
       {Platform.OS !== 'web' ? (
-        <CameraView style={StyleSheet.absoluteFill} facing="back" />
+        <CameraView style={StyleSheet.absoluteFill} facing="front" />
       ) : (
         <View style={[StyleSheet.absoluteFill, { backgroundColor: '#1a1a1a' }]} />
       )}

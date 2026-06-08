@@ -3,20 +3,131 @@ import {
   View, Text, TouchableOpacity, StyleSheet, useWindowDimensions, Animated, Platform
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { CameraView } from 'expo-camera';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useKeepAwake } from 'expo-keep-awake';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
+import jpeg from 'jpeg-js';
 import { useColors } from '@/hooks/use-colors';
 import { useScreenOrientation } from '@/hooks/use-screen-orientation';
 import { useAppContext } from '@/lib/AppContext';
-import type { Difficulty, JudgeResult, PoseLandmarks, TrainingLevel, TrainingQuestion } from '@/lib/types';
+import type { ColorName, Difficulty, Direction, JudgeResult, TrainingLevel, TrainingQuestion } from '@/lib/types';
 import { DIFFICULTY_CONFIG, LEVEL_CONFIG } from '@/lib/types';
 import { generateQuestionsForLevel, generateSessionMappings } from '@/lib/questionGeneratorV2';
-import { judgeMotion, isPoseDetected } from '@/lib/poseJudge';
 import { buildResult } from '@/lib/scoring';
 
 const TOTAL_QUESTIONS = 20;
+const CAPTURE_INTERVAL_MS = 260;
+const BASELINE_DELAY_MS = 500;
+const AWAY_CHANGE_RATIO = 0.018;
+const HOME_CHANGE_RATIO = 0.009;
+const RETURN_FRAMES_REQUIRED = 2;
+
+type ExpectedMotion = 'step_forward' | 'step_back' | 'step_left' | 'step_right';
+type MotionPhase = 'settling' | 'waitingAway' | 'waitingReturn';
+
+interface FrameAnalysis {
+  changeRatio: number;
+  centerX: number;
+  radialMean: number;
+}
+
+const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+
+function decodeBase64(input: string): Uint8Array {
+  const clean = input.replace(/[^A-Za-z0-9+/=]/g, '');
+  const bytes: number[] = [];
+
+  for (let i = 0; i < clean.length;) {
+    const enc1 = BASE64_CHARS.indexOf(clean.charAt(i++));
+    const enc2 = BASE64_CHARS.indexOf(clean.charAt(i++));
+    const enc3 = BASE64_CHARS.indexOf(clean.charAt(i++));
+    const enc4 = BASE64_CHARS.indexOf(clean.charAt(i++));
+
+    const chr1 = (enc1 << 2) | (enc2 >> 4);
+    const chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+    const chr3 = ((enc3 & 3) << 6) | enc4;
+
+    bytes.push(chr1);
+    if (enc3 !== 64) bytes.push(chr2);
+    if (enc4 !== 64) bytes.push(chr3);
+  }
+
+  return new Uint8Array(bytes);
+}
+
+function toLumaFrame(base64: string): { width: number; height: number; luma: Uint8Array } | null {
+  try {
+    const decoded = jpeg.decode(decodeBase64(base64), { useTArray: true });
+    const luma = new Uint8Array(decoded.width * decoded.height);
+
+    for (let i = 0, j = 0; i < decoded.data.length; i += 4, j += 1) {
+      luma[j] = (decoded.data[i] * 0.299 + decoded.data[i + 1] * 0.587 + decoded.data[i + 2] * 0.114) | 0;
+    }
+
+    return { width: decoded.width, height: decoded.height, luma };
+  } catch {
+    return null;
+  }
+}
+
+function analyzeAgainstBaseline(
+  baseline: { width: number; height: number; luma: Uint8Array },
+  current: { width: number; height: number; luma: Uint8Array },
+): FrameAnalysis | null {
+  if (baseline.width !== current.width || baseline.height !== current.height) return null;
+
+  let changed = 0;
+  let sumX = 0;
+  let sumRadial = 0;
+  const threshold = 28;
+  const step = 4;
+  const width = current.width;
+  const height = current.height;
+  const startY = Math.floor(height * 0.12);
+  const endY = Math.floor(height * 0.92);
+
+  for (let y = startY; y < endY; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const index = y * width + x;
+      if (Math.abs(current.luma[index] - baseline.luma[index]) < threshold) continue;
+
+      const nx = x / width;
+      const ny = y / height;
+      changed += 1;
+      sumX += nx;
+      sumRadial += Math.hypot(nx - 0.5, ny - 0.5);
+    }
+  }
+
+  const sampled = Math.ceil((endY - startY) / step) * Math.ceil(width / step);
+  if (changed < Math.max(10, sampled * 0.002)) {
+    return { changeRatio: 0, centerX: 0.5, radialMean: 0 };
+  }
+
+  return {
+    changeRatio: changed / sampled,
+    centerX: sumX / changed,
+    radialMean: sumRadial / changed,
+  };
+}
+
+function isAwayMotion(expected: ExpectedMotion, analysis: FrameAnalysis): boolean {
+  if (analysis.changeRatio < AWAY_CHANGE_RATIO) return false;
+
+  switch (expected) {
+    case 'step_right':
+      return analysis.centerX > 0.56;
+    case 'step_left':
+      return analysis.centerX < 0.44;
+    case 'step_forward':
+      return analysis.radialMean > 0.27 || analysis.changeRatio > 0.045;
+    case 'step_back':
+      return analysis.radialMean > 0.16 && analysis.radialMean < 0.28;
+    default:
+      return false;
+  }
+}
 
 export default function TrainingScreen() {
   useKeepAwake();
@@ -27,14 +138,26 @@ export default function TrainingScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 768;
   const { state, addResult } = useAppContext();
+  const [permission, requestPermission] = useCameraPermissions();
 
   const diff = (difficulty as Difficulty) || 'beginner';
   const lv = (level as TrainingLevel) || 'level1';
   const timeLimit = DIFFICULTY_CONFIG[diff].timeLimit;
 
-  // セッション用のマッピングを生成
-  const { numberMapping, colorMapping } = generateSessionMappings();
-  const questions = generateQuestionsForLevel(lv, numberMapping, colorMapping);
+  // セッション中は出題と対応表を固定する
+  const sessionMappingsRef = useRef<ReturnType<typeof generateSessionMappings> | null>(null);
+  const questionsRef = useRef<TrainingQuestion[] | null>(null);
+  if (!sessionMappingsRef.current) {
+    sessionMappingsRef.current = generateSessionMappings();
+  }
+  if (!questionsRef.current) {
+    questionsRef.current = generateQuestionsForLevel(
+      lv,
+      sessionMappingsRef.current.numberMapping,
+      sessionMappingsRef.current.colorMapping,
+    );
+  }
+  const questions = questionsRef.current;
 
   // ===== State =====
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -46,15 +169,27 @@ export default function TrainingScreen() {
   const [results, setResults] = useState<Array<{ result: JudgeResult; reactionTimeMs: number }>>([]);
   const [timerProgress, setTimerProgress] = useState(1);
   const [isFinished, setIsFinished] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [motionHint, setMotionHint] = useState('中央で待機');
 
+  const cameraRef = useRef<CameraView | null>(null);
   const questionStartTime = useRef(Date.now());
   const sessionStartTime = useRef(Date.now());
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const judgeRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prevPose = useRef<PoseLandmarks | null>(null);
-  const currentPose = useRef<PoseLandmarks | null>(null);
+  const captureRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const baselineFrame = useRef<{ width: number; height: number; luma: Uint8Array } | null>(null);
+  const baselineReadyAt = useRef(0);
+  const motionPhase = useRef<MotionPhase>('settling');
+  const returnFrames = useRef(0);
   const judgedRef = useRef(false);
+  const captureBusy = useRef(false);
   const feedbackAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' && !permission?.granted) {
+      requestPermission();
+    }
+  }, [permission?.granted, requestPermission]);
 
   // ===== 問題表示テキストを生成 =====
   const getQuestionDisplay = (q: TrainingQuestion): string => {
@@ -69,63 +204,88 @@ export default function TrainingScreen() {
   };
 
   // ===== 問題から期待される動作方向を取得 =====
-  const getExpectedMotion = (q: TrainingQuestion): 'step_forward' | 'step_back' | 'step_left' | 'step_right' => {
-    let direction: 'forward' | 'back' | 'left' | 'right' = 'forward';
+  const getExpectedDirection = (q: TrainingQuestion): Direction => {
+    let direction: Direction = 'forward';
     
     if (q.type === 'level1') {
-      direction = (q as any).direction;
+      direction = q.direction;
     } else if (q.type === 'level2') {
-      direction = (q as any).correctDirection;
+      direction = q.correctDirection;
     } else if (q.type === 'level3') {
-      direction = (q as any).correctDirection;
-    } else {
-      // level4は複合型なので、元の型を判定して対応する方向を取得
-      if ('direction' in q) {
-        direction = (q as any).direction;
-      } else if ('correctDirection' in q) {
-        direction = (q as any).correctDirection;
-      }
+      direction = q.correctDirection;
     }
-    
-    // Direction型をMotionType型に変換
-    const directionToMotion: Record<'forward' | 'back' | 'left' | 'right', 'step_forward' | 'step_back' | 'step_left' | 'step_right'> = {
+
+    return direction;
+  };
+
+  // ===== 問題から期待される動作方向を取得 =====
+  const getExpectedMotion = (q: TrainingQuestion): ExpectedMotion => {
+    const directionToMotion: Record<Direction, ExpectedMotion> = {
       forward: 'step_forward',
       back: 'step_back',
       left: 'step_left',
       right: 'step_right',
     };
     
-    return directionToMotion[direction];
+    return directionToMotion[getExpectedDirection(q)];
+  };
+
+  const getDirectionMoveLabel = (direction: Direction): string => {
+    const labels: Record<Direction, string> = {
+      forward: '前へ移動',
+      back: '後ろへ移動',
+      left: '左へ移動',
+      right: '右へ移動',
+    };
+    return labels[direction];
+  };
+
+  const getSpeechCue = (q: TrainingQuestion): string => {
+    if (q.type === 'level1') {
+      const cues: Record<Direction, string> = {
+        forward: 'まえ！',
+        back: 'うしろ！',
+        left: 'ひだり！',
+        right: 'みぎ！',
+      };
+      return cues[q.direction];
+    }
+
+    if (q.type === 'level2') {
+      const cues: Record<1 | 2 | 3 | 4, string> = {
+        1: 'いち！',
+        2: 'に！',
+        3: 'さん！',
+        4: 'よん！',
+      };
+      return cues[q.number];
+    }
+
+    const colorCues: Record<ColorName, string> = {
+      blue: 'あお！',
+      red: 'あか！',
+      yellow: 'き！',
+      green: 'みどり！',
+    };
+    return colorCues[q.color];
   };
 
   // ===== 問題開始 =====
   const startQuestion = useCallback((q: TrainingQuestion) => {
     setCurrentQuestion(q);
     setJudgeResult(null);
+    setMotionHint('中央で待機');
     judgedRef.current = false;
+    baselineFrame.current = null;
+    baselineReadyAt.current = Date.now() + BASELINE_DELAY_MS;
+    motionPhase.current = 'settling';
+    returnFrames.current = 0;
     questionStartTime.current = Date.now();
     setTimerProgress(1);
 
-    // 音声読み上げ（レベル別）
     if (state.settings.voiceEnabled && Platform.OS !== 'web') {
       Speech.stop();
-      let speechText = '';
-      if (q.type === 'level1') {
-        speechText = `${q.displayText}へ移動`;
-      } else if (q.type === 'level2') {
-        speechText = `${(q as any).number}番の方向へ移動`;
-      } else if (q.type === 'level3') {
-        speechText = `${(q as any).color}の方向へ移動`;
-      } else if ((q as any).type === 'level4') {
-        if ('direction' in q) {
-          speechText = `${(q as any).displayText}へ移動`;
-        } else if ('number' in q) {
-          speechText = `${(q as any).number}番の方向へ移動`;
-        } else if ('color' in q) {
-          speechText = `${(q as any).color}の方向へ移動`;
-        }
-      }
-      Speech.speak(speechText, { language: 'ja-JP', rate: 1.1 });
+      Speech.speak(getSpeechCue(q), { language: 'ja-JP', rate: 1.18, pitch: 1.08 });
     }
   }, [state.settings.voiceEnabled]);
 
@@ -147,31 +307,83 @@ export default function TrainingScreen() {
     };
   }, [questionIndex, isFinished, timeLimit]);
 
-  // ===== ポーズ判定ループ =====
-  useEffect(() => {
-    if (isFinished) return;
-    judgeRef.current = setInterval(() => {
-      if (judgedRef.current) return;
-      const prev = prevPose.current;
-      const curr = currentPose.current;
-      if (!prev || !curr) return;
+  const captureAndJudge = useCallback(async () => {
+    if (
+      Platform.OS === 'web' ||
+      isFinished ||
+      judgedRef.current ||
+      captureBusy.current ||
+      !cameraReady ||
+      !cameraRef.current
+    ) {
+      return;
+    }
 
-      // 期待される動作方向を取得
-      const expectedMotion = getExpectedMotion(currentQuestion);
+    captureBusy.current = true;
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true,
+        quality: 0.08,
+        skipProcessing: true,
+        shutterSound: false,
+      });
+      if (!photo.base64) return;
 
-      // 実際のポーズから動作を判定
-      const isCorrect = judgeMotion(expectedMotion, prev, curr);
+      const frame = toLumaFrame(photo.base64);
+      if (!frame) return;
 
-      if (isCorrect) {
-        const elapsed = Date.now() - questionStartTime.current;
-        handleJudge('success', elapsed);
+      if (!baselineFrame.current || Date.now() < baselineReadyAt.current) {
+        baselineFrame.current = frame;
+        setMotionHint('中央で待機');
+        return;
       }
-    }, 100);
+
+      const analysis = analyzeAgainstBaseline(baselineFrame.current, frame);
+      if (!analysis) return;
+
+      const expectedMotion = getExpectedMotion(currentQuestion);
+      const expectedDirection = getExpectedDirection(currentQuestion);
+
+      if (motionPhase.current === 'settling') {
+        motionPhase.current = 'waitingAway';
+        setMotionHint(getDirectionMoveLabel(expectedDirection));
+      }
+
+      if (motionPhase.current === 'waitingAway') {
+        if (isAwayMotion(expectedMotion, analysis)) {
+          motionPhase.current = 'waitingReturn';
+          returnFrames.current = 0;
+          setMotionHint('中央に戻る');
+        }
+        return;
+      }
+
+      if (motionPhase.current === 'waitingReturn') {
+        if (analysis.changeRatio <= HOME_CHANGE_RATIO) {
+          returnFrames.current += 1;
+        } else {
+          returnFrames.current = 0;
+        }
+
+        if (returnFrames.current >= RETURN_FRAMES_REQUIRED) {
+          const elapsed = Date.now() - questionStartTime.current;
+          handleJudge('success', elapsed);
+        }
+      }
+    } finally {
+      captureBusy.current = false;
+    }
+  }, [cameraReady, currentQuestion, isFinished]);
+
+  // ===== カメラフレーム判定ループ =====
+  useEffect(() => {
+    if (isFinished || Platform.OS === 'web' || !permission?.granted) return;
+    captureRef.current = setInterval(captureAndJudge, CAPTURE_INTERVAL_MS);
 
     return () => {
-      if (judgeRef.current) clearInterval(judgeRef.current);
+      if (captureRef.current) clearInterval(captureRef.current);
     };
-  }, [currentQuestion]);
+  }, [captureAndJudge, isFinished, permission?.granted]);
 
   // ===== 判定処理 =====
   const handleJudge = useCallback((result: JudgeResult, reactionTimeMs: number) => {
@@ -280,15 +492,32 @@ export default function TrainingScreen() {
     ? currentQuestion.colorHex 
     : '#000000';
 
+  if (Platform.OS !== 'web' && !permission?.granted) {
+    return (
+      <View style={[styles.permissionContainer, { backgroundColor: colors.background }]}>
+        <Text style={[styles.permissionText, { color: colors.foreground }]}>
+          トレーニングにはフロントカメラの使用許可が必要です
+        </Text>
+        <TouchableOpacity
+          style={[styles.permissionButton, { backgroundColor: colors.primary }]}
+          onPress={requestPermission}
+        >
+          <Text style={styles.permissionButtonText}>カメラを許可する</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
   return (
     <View style={[styles.container, { backgroundColor: bgColor }]}>
       {/* カメラ背景 */}
       {Platform.OS !== 'web' ? (
         <CameraView 
+          ref={cameraRef}
           style={StyleSheet.absoluteFill} 
-          facing="back"
+          facing="front"
           onCameraReady={() => {
-            // カメラ準備完了時の処理
+            setCameraReady(true);
           }}
         />
       ) : (
@@ -331,6 +560,11 @@ export default function TrainingScreen() {
         {currentQuestion.type === 'level3' && (
           <View style={[styles.colorCard, { backgroundColor: currentQuestion.colorHex }]} />
         )}
+        <View style={styles.motionHintBox}>
+          <Text style={[styles.motionHintText, { fontSize: isTablet ? 20 : 16 }]}>
+            {motionHint}
+          </Text>
+        </View>
       </View>
 
       {/* 判定フィードバック */}
@@ -362,6 +596,7 @@ export default function TrainingScreen() {
         style={styles.stopBtn}
         onPress={() => {
           Speech.stop();
+          if (captureRef.current) clearInterval(captureRef.current);
           router.back();
         }}
       >
@@ -372,6 +607,28 @@ export default function TrainingScreen() {
 }
 
 const styles = StyleSheet.create({
+  permissionContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 16,
+    padding: 32,
+  },
+  permissionText: {
+    fontSize: 18,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  permissionButton: {
+    paddingHorizontal: 28,
+    paddingVertical: 14,
+    borderRadius: 24,
+  },
+  permissionButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '800',
+  },
   container: {
     flex: 1,
     backgroundColor: '#000',
@@ -438,6 +695,18 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 8,
     elevation: 8,
+  },
+  motionHintBox: {
+    minWidth: 160,
+    alignItems: 'center',
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  motionHintText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
   },
   feedbackOverlay: {
     ...StyleSheet.absoluteFillObject,
