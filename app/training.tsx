@@ -18,9 +18,11 @@ import { buildResult } from '@/lib/scoring';
 
 const TOTAL_QUESTIONS = 20;
 const CAPTURE_INTERVAL_MS = 260;
-const BASELINE_DELAY_MS = 500;
-const AWAY_CHANGE_RATIO = 0.018;
-const HOME_CHANGE_RATIO = 0.009;
+const BASELINE_DELAY_MS = 700;
+const COUNTDOWN_SECONDS = 5;
+const AWAY_CHANGE_RATIO = 0.006;
+const TARGET_ZONE_RATIO = 0.009;
+const HOME_CHANGE_RATIO = 0.014;
 const RETURN_FRAMES_REQUIRED = 2;
 
 type ExpectedMotion = 'step_forward' | 'step_back' | 'step_left' | 'step_right';
@@ -29,7 +31,13 @@ type MotionPhase = 'settling' | 'waitingAway' | 'waitingReturn';
 interface FrameAnalysis {
   changeRatio: number;
   centerX: number;
+  centerY: number;
   radialMean: number;
+  leftRatio: number;
+  rightRatio: number;
+  centerRatio: number;
+  forwardRatio: number;
+  backRatio: number;
 }
 
 const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
@@ -79,9 +87,20 @@ function analyzeAgainstBaseline(
 
   let changed = 0;
   let sumX = 0;
+  let sumY = 0;
   let sumRadial = 0;
-  const threshold = 28;
-  const step = 4;
+  let leftChanged = 0;
+  let rightChanged = 0;
+  let centerChanged = 0;
+  let forwardChanged = 0;
+  let backChanged = 0;
+  let leftSampled = 0;
+  let rightSampled = 0;
+  let centerSampled = 0;
+  let forwardSampled = 0;
+  let backSampled = 0;
+  const threshold = 14;
+  const step = 5;
   const width = current.width;
   const height = current.height;
   const startY = Math.floor(height * 0.12);
@@ -90,25 +109,53 @@ function analyzeAgainstBaseline(
   for (let y = startY; y < endY; y += step) {
     for (let x = 0; x < width; x += step) {
       const index = y * width + x;
-      if (Math.abs(current.luma[index] - baseline.luma[index]) < threshold) continue;
-
       const nx = x / width;
       const ny = y / height;
+      if (nx < 0.35) leftSampled += 1;
+      if (nx > 0.65) rightSampled += 1;
+      if (nx >= 0.35 && nx <= 0.65 && ny >= 0.25 && ny <= 0.75) centerSampled += 1;
+      if (nx >= 0.34 && nx <= 0.66 && ny >= 0.08 && ny <= 0.46) backSampled += 1;
+      if (nx >= 0.30 && nx <= 0.70 && ny >= 0.54 && ny <= 0.94) forwardSampled += 1;
+
+      if (Math.abs(current.luma[index] - baseline.luma[index]) < threshold) continue;
+
       changed += 1;
       sumX += nx;
+      sumY += ny;
       sumRadial += Math.hypot(nx - 0.5, ny - 0.5);
+      if (nx < 0.35) leftChanged += 1;
+      if (nx > 0.65) rightChanged += 1;
+      if (nx >= 0.35 && nx <= 0.65 && ny >= 0.25 && ny <= 0.75) centerChanged += 1;
+      if (nx >= 0.34 && nx <= 0.66 && ny >= 0.08 && ny <= 0.46) backChanged += 1;
+      if (nx >= 0.30 && nx <= 0.70 && ny >= 0.54 && ny <= 0.94) forwardChanged += 1;
     }
   }
 
   const sampled = Math.ceil((endY - startY) / step) * Math.ceil(width / step);
   if (changed < Math.max(10, sampled * 0.002)) {
-    return { changeRatio: 0, centerX: 0.5, radialMean: 0 };
+    return {
+      changeRatio: 0,
+      centerX: 0.5,
+      centerY: 0.5,
+      radialMean: 0,
+      leftRatio: 0,
+      rightRatio: 0,
+      centerRatio: 0,
+      forwardRatio: 0,
+      backRatio: 0,
+    };
   }
 
   return {
     changeRatio: changed / sampled,
     centerX: sumX / changed,
+    centerY: sumY / changed,
     radialMean: sumRadial / changed,
+    leftRatio: leftSampled ? leftChanged / leftSampled : 0,
+    rightRatio: rightSampled ? rightChanged / rightSampled : 0,
+    centerRatio: centerSampled ? centerChanged / centerSampled : 0,
+    forwardRatio: forwardSampled ? forwardChanged / forwardSampled : 0,
+    backRatio: backSampled ? backChanged / backSampled : 0,
   };
 }
 
@@ -117,13 +164,13 @@ function isAwayMotion(expected: ExpectedMotion, analysis: FrameAnalysis): boolea
 
   switch (expected) {
     case 'step_right':
-      return analysis.centerX > 0.56;
+      return analysis.rightRatio > TARGET_ZONE_RATIO || analysis.centerX > 0.58;
     case 'step_left':
-      return analysis.centerX < 0.44;
+      return analysis.leftRatio > TARGET_ZONE_RATIO || analysis.centerX < 0.42;
     case 'step_forward':
-      return analysis.radialMean > 0.27 || analysis.changeRatio > 0.045;
+      return analysis.forwardRatio > TARGET_ZONE_RATIO || analysis.changeRatio > 0.018 || analysis.centerY > 0.54;
     case 'step_back':
-      return analysis.radialMean > 0.16 && analysis.radialMean < 0.28;
+      return analysis.backRatio > TARGET_ZONE_RATIO || (analysis.changeRatio > 0.01 && analysis.centerY < 0.48);
     default:
       return false;
   }
@@ -170,6 +217,8 @@ export default function TrainingScreen() {
   const [timerProgress, setTimerProgress] = useState(1);
   const [isFinished, setIsFinished] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
+  const [trainingStarted, setTrainingStarted] = useState(false);
+  const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
   const [motionHint, setMotionHint] = useState('中央で待機');
 
   const cameraRef = useRef<CameraView | null>(null);
@@ -177,6 +226,7 @@ export default function TrainingScreen() {
   const sessionStartTime = useRef(Date.now());
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const captureRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const baselineFrame = useRef<{ width: number; height: number; luma: Uint8Array } | null>(null);
   const baselineReadyAt = useRef(0);
   const motionPhase = useRef<MotionPhase>('settling');
@@ -190,6 +240,8 @@ export default function TrainingScreen() {
       requestPermission();
     }
   }, [permission?.granted, requestPermission]);
+
+  const canStartCountdown = Platform.OS === 'web' || (permission?.granted && cameraReady);
 
   // ===== 問題表示テキストを生成 =====
   const getQuestionDisplay = (q: TrainingQuestion): string => {
@@ -291,7 +343,7 @@ export default function TrainingScreen() {
 
   // ===== タイマー =====
   useEffect(() => {
-    if (isFinished) return;
+    if (isFinished || !trainingStarted) return;
     timerRef.current = setInterval(() => {
       const elapsed = Date.now() - questionStartTime.current;
       const progress = Math.max(0, 1 - elapsed / timeLimit);
@@ -305,12 +357,13 @@ export default function TrainingScreen() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [questionIndex, isFinished, timeLimit]);
+  }, [questionIndex, isFinished, timeLimit, trainingStarted]);
 
   const captureAndJudge = useCallback(async () => {
     if (
       Platform.OS === 'web' ||
       isFinished ||
+      !trainingStarted ||
       judgedRef.current ||
       captureBusy.current ||
       !cameraReady ||
@@ -323,7 +376,7 @@ export default function TrainingScreen() {
     try {
       const photo = await cameraRef.current.takePictureAsync({
         base64: true,
-        quality: 0.08,
+        quality: 0.16,
         skipProcessing: true,
         shutterSound: false,
       });
@@ -373,17 +426,17 @@ export default function TrainingScreen() {
     } finally {
       captureBusy.current = false;
     }
-  }, [cameraReady, currentQuestion, isFinished]);
+  }, [cameraReady, currentQuestion, isFinished, trainingStarted]);
 
   // ===== カメラフレーム判定ループ =====
   useEffect(() => {
-    if (isFinished || Platform.OS === 'web' || !permission?.granted) return;
+    if (isFinished || !trainingStarted || Platform.OS === 'web' || !permission?.granted) return;
     captureRef.current = setInterval(captureAndJudge, CAPTURE_INTERVAL_MS);
 
     return () => {
       if (captureRef.current) clearInterval(captureRef.current);
     };
-  }, [captureAndJudge, isFinished, permission?.granted]);
+  }, [captureAndJudge, isFinished, permission?.granted, trainingStarted]);
 
   // ===== 判定処理 =====
   const handleJudge = useCallback((result: JudgeResult, reactionTimeMs: number) => {
@@ -465,12 +518,32 @@ export default function TrainingScreen() {
 
   // 初回問題開始
   useEffect(() => {
-    sessionStartTime.current = Date.now();
-    startQuestion(currentQuestion);
+    if (!canStartCountdown || trainingStarted || countdownRef.current) return;
+
+    setCountdown(COUNTDOWN_SECONDS);
+    countdownRef.current = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) {
+          if (countdownRef.current) clearInterval(countdownRef.current);
+          countdownRef.current = null;
+          sessionStartTime.current = Date.now();
+          setTrainingStarted(true);
+          startQuestion(questions[0]);
+          return 0;
+        }
+
+        return prev - 1;
+      });
+    }, 1000);
+
     return () => {
+      if (countdownRef.current) {
+        clearInterval(countdownRef.current);
+        countdownRef.current = null;
+      }
       Speech.stop();
     };
-  }, []);
+  }, [canStartCountdown, questions, startQuestion, trainingStarted]);
 
   // ===== UI =====
   const feedbackColor =
@@ -527,6 +600,25 @@ export default function TrainingScreen() {
       {/* 半透明オーバーレイ */}
       <View style={[StyleSheet.absoluteFill, styles.overlay]} />
 
+      {/* 動く位置の常時ガイド */}
+      <View pointerEvents="none" style={styles.zoneGuide}>
+        <View style={[styles.sideZone, styles.leftZone]}>
+          <Text style={styles.zoneLabel}>左</Text>
+        </View>
+        <View style={[styles.sideZone, styles.rightZone]}>
+          <Text style={styles.zoneLabel}>右</Text>
+        </View>
+        <View style={styles.centerZone}>
+          <Text style={styles.zoneLabel}>中央</Text>
+        </View>
+        <View style={[styles.depthZone, styles.backZone]}>
+          <Text style={styles.zoneLabel}>後</Text>
+        </View>
+        <View style={[styles.depthZone, styles.forwardZone]}>
+          <Text style={styles.zoneLabel}>前</Text>
+        </View>
+      </View>
+
       {/* タイマーバー */}
       <View style={styles.timerContainer}>
         <View style={[styles.timerBg, { backgroundColor: 'rgba(255,255,255,0.2)' }]}>
@@ -554,17 +646,30 @@ export default function TrainingScreen() {
 
       {/* 問題表示 */}
       <View style={styles.questionArea}>
-        <Text style={[styles.cognitiveText, { fontSize: isTablet ? 80 : 64, color: '#FFFFFF' }]}>
-          {getQuestionDisplay(currentQuestion)}
-        </Text>
-        {currentQuestion.type === 'level3' && (
-          <View style={[styles.colorCard, { backgroundColor: currentQuestion.colorHex }]} />
+        {!trainingStarted ? (
+          <View style={styles.countdownBox}>
+            <Text style={[styles.countdownNumber, { fontSize: isTablet ? 96 : 76 }]}>
+              {countdown}
+            </Text>
+            <Text style={[styles.countdownText, { fontSize: isTablet ? 22 : 18 }]}>
+              中央で構えてください
+            </Text>
+          </View>
+        ) : (
+          <>
+            <Text style={[styles.cognitiveText, { fontSize: isTablet ? 80 : 64, color: '#FFFFFF' }]}>
+              {getQuestionDisplay(currentQuestion)}
+            </Text>
+            {currentQuestion.type === 'level3' && (
+              <View style={[styles.colorCard, { backgroundColor: currentQuestion.colorHex }]} />
+            )}
+            <View style={styles.motionHintBox}>
+              <Text style={[styles.motionHintText, { fontSize: isTablet ? 20 : 16 }]}>
+                {motionHint}
+              </Text>
+            </View>
+          </>
         )}
-        <View style={styles.motionHintBox}>
-          <Text style={[styles.motionHintText, { fontSize: isTablet ? 20 : 16 }]}>
-            {motionHint}
-          </Text>
-        </View>
       </View>
 
       {/* 判定フィードバック */}
@@ -596,6 +701,7 @@ export default function TrainingScreen() {
         style={styles.stopBtn}
         onPress={() => {
           Speech.stop();
+          if (countdownRef.current) clearInterval(countdownRef.current);
           if (captureRef.current) clearInterval(captureRef.current);
           router.back();
         }}
@@ -634,7 +740,67 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   overlay: {
-    backgroundColor: 'rgba(0,0,0,0.45)',
+    backgroundColor: 'rgba(0,0,0,0.32)',
+  },
+  zoneGuide: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  sideZone: {
+    position: 'absolute',
+    top: '16%',
+    bottom: '16%',
+    width: '25%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderColor: 'rgba(255,255,255,0.55)',
+    backgroundColor: 'rgba(0,0,0,0.08)',
+  },
+  leftZone: {
+    left: 0,
+    borderRightWidth: 1,
+  },
+  rightZone: {
+    right: 0,
+    borderLeftWidth: 1,
+  },
+  centerZone: {
+    position: 'absolute',
+    left: '37%',
+    right: '37%',
+    top: '30%',
+    bottom: '30%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderRadius: 8,
+    borderColor: 'rgba(255,255,255,0.7)',
+    backgroundColor: 'rgba(0,0,0,0.10)',
+  },
+  depthZone: {
+    position: 'absolute',
+    left: '30%',
+    right: '30%',
+    height: '16%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderColor: 'rgba(255,255,255,0.55)',
+    backgroundColor: 'rgba(0,0,0,0.08)',
+  },
+  backZone: {
+    top: '10%',
+    borderBottomWidth: 1,
+  },
+  forwardZone: {
+    bottom: '10%',
+    borderTopWidth: 1,
+  },
+  zoneLabel: {
+    color: 'rgba(255,255,255,0.78)',
+    fontSize: 18,
+    fontWeight: '900',
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
   },
   timerContainer: {
     position: 'absolute',
@@ -695,6 +861,29 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 8,
     elevation: 8,
+  },
+  countdownBox: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    paddingHorizontal: 28,
+    paddingVertical: 18,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  countdownNumber: {
+    color: '#FFFFFF',
+    fontWeight: '900',
+    lineHeight: 104,
+    textAlign: 'center',
+    textShadowColor: 'rgba(0,0,0,0.9)',
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+  },
+  countdownText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+    textAlign: 'center',
   },
   motionHintBox: {
     minWidth: 160,
