@@ -18,7 +18,6 @@
       }
     },
     "production": {
-      "autoIncrement": true,
       "ios": {
         "image": "latest"
       }
@@ -27,7 +26,10 @@
   "submit": {
     "production": {
       "ios": {
-        "ascAppId": "6777510970"
+        "ascAppId": "6777510970",
+        "ascApiKeyPath": "C:\\Users\\koizumi.esc\\Desktop\\AuthKey_4J93K5VYNL.p8",
+        "ascApiKeyId": "4J93K5VYNL",
+        "ascApiKeyIssuerId": "c66c1b60-3c4f-4ae6-83fb-231e112ed35d"
       }
     }
   }
