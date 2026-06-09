@@ -20,14 +20,15 @@ const TOTAL_QUESTIONS = 20;
 const CAPTURE_INTERVAL_MS = 260;
 const BASELINE_DELAY_MS = 700;
 const COUNTDOWN_SECONDS = 5;
-const AWAY_CHANGE_RATIO = 0.006;
-const TARGET_ZONE_RATIO = 0.009;
-const HOME_CHANGE_RATIO = 0.014;
+const AWAY_CHANGE_RATIO = 0.0025;
+const TARGET_ZONE_RATIO = 0.0028;
+const HOME_CHANGE_RATIO = 0.020;
 const RETURN_FRAMES_REQUIRED = 2;
 
 type ExpectedMotion = 'step_forward' | 'step_back' | 'step_left' | 'step_right';
 type MotionPhase = 'settling' | 'waitingAway' | 'waitingReturn';
 type CalibrationKey = 'center' | Direction;
+type MotionZone = 'center' | Direction;
 
 interface LumaFrame {
   width: number;
@@ -51,6 +52,13 @@ interface CalibrationStatus {
   key: CalibrationKey;
   title: string;
   detail: string;
+}
+
+interface GridMotion {
+  bestZone: MotionZone;
+  confidence: number;
+  totalChangeRatio: number;
+  zones: Record<MotionZone, number>;
 }
 
 const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
@@ -252,6 +260,99 @@ function detectCalibratedMotion(
   const adaptiveThreshold = Math.max(TARGET_ZONE_RATIO * 1.8, Math.min(0.09, templateScore * 0.34));
 
   return expectedScore >= adaptiveThreshold && expectedScore >= bestOther * 0.82;
+}
+
+function getGridZone(nx: number, ny: number): MotionZone | null {
+  if (nx <= 0.30 && ny >= 0.16 && ny <= 0.84) return 'left';
+  if (nx >= 0.70 && ny >= 0.16 && ny <= 0.84) return 'right';
+  if (nx >= 0.30 && nx <= 0.70 && ny <= 0.34) return 'back';
+  if (nx >= 0.30 && nx <= 0.70 && ny >= 0.66) return 'forward';
+  if (nx >= 0.34 && nx <= 0.66 && ny >= 0.34 && ny <= 0.66) return 'center';
+  return null;
+}
+
+function analyzeGridMotion(baseline: LumaFrame, current: LumaFrame): GridMotion | null {
+  if (baseline.width !== current.width || baseline.height !== current.height) return null;
+
+  const changedByZone: Record<MotionZone, number> = {
+    center: 0,
+    forward: 0,
+    back: 0,
+    left: 0,
+    right: 0,
+  };
+  const sampledByZone: Record<MotionZone, number> = {
+    center: 0,
+    forward: 0,
+    back: 0,
+    left: 0,
+    right: 0,
+  };
+
+  const threshold = 8;
+  const step = 4;
+  let totalChanged = 0;
+  let totalSampled = 0;
+
+  for (let y = 0; y < current.height; y += step) {
+    for (let x = 0; x < current.width; x += step) {
+      const nx = x / current.width;
+      const ny = y / current.height;
+      const zone = getGridZone(nx, ny);
+      if (!zone) continue;
+
+      sampledByZone[zone] += 1;
+      totalSampled += 1;
+
+      const index = y * current.width + x;
+      if (Math.abs(current.luma[index] - baseline.luma[index]) < threshold) continue;
+
+      changedByZone[zone] += 1;
+      totalChanged += 1;
+    }
+  }
+
+  const zones: Record<MotionZone, number> = {
+    center: sampledByZone.center ? changedByZone.center / sampledByZone.center : 0,
+    forward: sampledByZone.forward ? changedByZone.forward / sampledByZone.forward : 0,
+    back: sampledByZone.back ? changedByZone.back / sampledByZone.back : 0,
+    left: sampledByZone.left ? changedByZone.left / sampledByZone.left : 0,
+    right: sampledByZone.right ? changedByZone.right / sampledByZone.right : 0,
+  };
+  const movementZones = ['forward', 'back', 'left', 'right'] as Direction[];
+  const bestZone = movementZones.reduce<MotionZone>((best, zone) => (
+    zones[zone] > zones[best] ? zone : best
+  ), 'forward');
+
+  return {
+    bestZone,
+    confidence: zones[bestZone],
+    totalChangeRatio: totalSampled ? totalChanged / totalSampled : 0,
+    zones,
+  };
+}
+
+function isExpectedGridMotion(expected: Direction, grid: GridMotion): boolean {
+  const expectedScore = grid.zones[expected];
+  const oppositeDirection: Record<Direction, Direction> = {
+    right: 'left',
+    left: 'right',
+    forward: 'back',
+    back: 'forward',
+  };
+  const oppositeScore = grid.zones[oppositeDirection[expected]];
+  const bestOther = Math.max(
+    ...(['forward', 'back', 'left', 'right'] as Direction[])
+      .filter(direction => direction !== expected)
+      .map(direction => grid.zones[direction]),
+  );
+
+  return (
+    expectedScore >= TARGET_ZONE_RATIO &&
+    grid.totalChangeRatio >= AWAY_CHANGE_RATIO &&
+    expectedScore >= oppositeScore * 0.75 &&
+    expectedScore >= bestOther * 0.55
+  );
 }
 
 export default function TrainingScreen() {
@@ -496,13 +597,15 @@ export default function TrainingScreen() {
 
       const analysis = analyzeAgainstBaseline(baselineFrame.current, frame);
       if (!analysis) return;
+      const grid = analyzeGridMotion(baselineFrame.current, frame);
+      if (!grid) return;
 
       const expectedMotion = getExpectedMotion(currentQuestion);
       const expectedDirection = getExpectedDirection(currentQuestion);
       const directionScores = (['right', 'left', 'forward', 'back'] as Direction[])
-        .map(direction => `${getDirectionMoveLabel(direction).replace('へ移動', '')}:${Math.round(calibratedDirectionScore(direction, analysis, directionTemplates.current) * 100)}`)
+        .map(direction => `${getDirectionMoveLabel(direction).replace('へ移動', '')}:${Math.round(grid.zones[direction] * 1000)}`)
         .join(' / ');
-      setDebugMotionText(`変化:${Math.round(analysis.changeRatio * 1000)} / ${directionScores}`);
+      setDebugMotionText(`グリッド:${grid.bestZone} ${Math.round(grid.confidence * 1000)} / ${directionScores}`);
 
       if (motionPhase.current === 'settling') {
         motionPhase.current = 'waitingAway';
@@ -510,7 +613,11 @@ export default function TrainingScreen() {
       }
 
       if (motionPhase.current === 'waitingAway') {
-        if (detectCalibratedMotion(expectedMotion, analysis, directionTemplates.current) || isAwayMotion(expectedMotion, analysis)) {
+        if (
+          isExpectedGridMotion(expectedDirection, grid) ||
+          detectCalibratedMotion(expectedMotion, analysis, directionTemplates.current) ||
+          isAwayMotion(expectedMotion, analysis)
+        ) {
           motionPhase.current = 'waitingReturn';
           returnFrames.current = 0;
           setMotionHint('中央に戻る');
@@ -519,7 +626,10 @@ export default function TrainingScreen() {
       }
 
       if (motionPhase.current === 'waitingReturn') {
-        if (analysis.changeRatio <= HOME_CHANGE_RATIO) {
+        if (
+          grid.totalChangeRatio <= HOME_CHANGE_RATIO ||
+          grid.zones[expectedDirection] <= TARGET_ZONE_RATIO * 0.45
+        ) {
           returnFrames.current += 1;
         } else {
           returnFrames.current = 0;
@@ -936,7 +1046,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: '16%',
     bottom: '16%',
-    width: '25%',
+    width: '30%',
     alignItems: 'center',
     justifyContent: 'center',
     borderColor: 'rgba(255,255,255,0.55)',
@@ -952,10 +1062,10 @@ const styles = StyleSheet.create({
   },
   centerZone: {
     position: 'absolute',
-    left: '37%',
-    right: '37%',
-    top: '30%',
-    bottom: '30%',
+    left: '34%',
+    right: '34%',
+    top: '34%',
+    bottom: '34%',
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2,
@@ -967,18 +1077,18 @@ const styles = StyleSheet.create({
     position: 'absolute',
     left: '30%',
     right: '30%',
-    height: '16%',
+    height: '34%',
     alignItems: 'center',
     justifyContent: 'center',
     borderColor: 'rgba(255,255,255,0.55)',
     backgroundColor: 'rgba(0,0,0,0.08)',
   },
   backZone: {
-    top: '10%',
+    top: 0,
     borderBottomWidth: 1,
   },
   forwardZone: {
-    bottom: '10%',
+    bottom: 0,
     borderTopWidth: 1,
   },
   zoneLabel: {
